@@ -1,0 +1,926 @@
+# =============================================================================
+#  CONSULTATION APPOINTMENT SCHEDULER FOR FIRST-YEAR BSIT STUDENTS
+# =============================================================================
+#
+#  This program solves three everyday problems with teacher consultations:
+#
+#  PROBLEM 1 - "When is my teacher free?"
+#     Students didn't know when teachers were available, so they made wasted
+#     trips to the faculty office.
+#     SOLVED BY: get_upcoming_slots() - shows every upcoming time in date
+#     order, marked OPEN (free) or BOOKED (taken), and lets the student search
+#     by subject or teacher. get_open_slots() lists only the free ones for booking.
+#
+#  PROBLEM 2 - "Everyone shows up at the same time."
+#     Students arrived together, causing long lines and rushed sessions.
+#     SOLVED BY: split_into_sessions() - a teacher's free block is cut into
+#     30-minute sessions, and book_slot() lets only ONE student take each
+#     session. find_conflict() stops a student from booking two sessions
+#     that overlap. Every student gets their own arrival time.
+#
+#  PROBLEM 3 - "Walk-ins are messy and nothing is recorded."
+#     Verbal, unrecorded requests made the queue unfair and left no history.
+#     SOLVED BY: book_slot() gives every booking a reference number (first
+#     come, first served). mark_done() and cancel_appointment() change the
+#     STATUS instead of erasing the record, so past sessions can be tracked.
+#     queue_order() shows teachers their appointments in arrival order.
+#
+#  HOW DATA IS KEPT
+#     Everything is stored in three simple lists while the program runs.
+#     When the program closes, the data is cleared (no file is saved).
+# =============================================================================
+
+from datetime import date, datetime, timedelta
+import calendar
+
+# Each user is a list:        [login name, password, role, full name, section or subject, student ID]
+users = []              # stores all registered users
+# Each slot is a list:        [teacher, weekday, time, status, year, month, date]
+#    status is "OPEN" (free to book), "BOOKED" (taken by a student)
+#    or "DONE" (the consultation has taken place)
+slots = []              # stores all consultation slots
+# Each appointment is a list: [student ID, teacher, weekday, time, purpose, status, date, ref no.]
+#    status is "BOOKED" (upcoming), "DONE" (finished) or "CANCELLED"
+appointments = []       # stores all booked appointments
+
+# One student per session. 30 minutes gives enough time for a real discussion
+# while keeping the line short. Change this number to make sessions longer/shorter.
+SESSION_MINUTES = 30    # length of one consultation session (one student per session)
+
+
+# ---------- HELPER: Convert time string to minutes from midnight ----------
+# Computers compare numbers more easily than clock text, so we turn times like
+# "10:30AM" into "minutes since midnight" (630). Then "is 10:30 before 11:00?"
+# becomes a simple "is 630 less than 660?".
+
+def clock_to_minutes(clock):
+    """Turn one clock reading like "10:30AM" into minutes since midnight (630)."""
+    period = clock[-2:]                              # last two letters: "AM" or "PM"
+    hour_str, minute_str = clock[:-2].split(":")     # "10:30" -> "10" and "30"
+    hour = int(hour_str)
+    minute = int(minute_str)
+
+    # Convert to 24-hour time: 12AM is hour 0, 1PM is hour 13, 12PM stays 12.
+    if period == "AM":
+        if hour == 12:
+            hour = 0
+    else:
+        if hour != 12:
+            hour = hour + 12
+    return hour * 60 + minute
+
+
+def time_to_minutes(time_str):
+    """Start of a range like "10:00AM-10:30AM", in minutes since midnight."""
+    # Take the part before the dash ("10:00AM") and convert it.
+    return clock_to_minutes(time_str.split("-")[0].strip())
+
+
+def get_end_minutes(time_str):
+    """End of a range like "10:00AM-10:30AM", in minutes since midnight."""
+    # Take the part after the dash ("10:30AM") and convert it.
+    return clock_to_minutes(time_str.split("-")[1].strip())
+
+
+def minutes_to_clock(total):
+    """Turn minutes since midnight (630) back into a clock reading ("10:30AM")."""
+    hour, minute = divmod(total, 60)          # 630 -> 10 hours and 30 minutes
+    period = "AM" if hour < 12 else "PM"
+    hour = hour % 12 or 12                    # 13 -> 1, 0 -> 12, 12 -> 12
+    return f"{hour}:{minute:02d}{period}"     # :02d keeps two digits, e.g. "1:05PM"
+
+
+def split_into_sessions(start_total, end_total, length=SESSION_MINUTES):
+    """Cut a teacher's free block into back-to-back sessions of `length` minutes.
+
+    (Problem 2) Example: 10:00AM-11:00AM becomes "10:00AM-10:30AM" and
+    "10:30AM-11:00AM". Each session is booked by one student only, so
+    students arrive one at a time instead of all at once. Leftover time
+    shorter than a full session is not used.
+    """
+    sessions = []
+    start = start_total
+    # Keep adding sessions while a whole session still fits before the end time.
+    while start + length <= end_total:
+        sessions.append(f"{minutes_to_clock(start)}-{minutes_to_clock(start + length)}")
+        start += length
+    return sessions
+
+
+def get_remaining_weekdays_this_month(day_name):
+    """
+    Generate only the remaining matching weekdays
+    from today until the END of the CURRENT MONTH (2026).
+
+    Example: if today is Oct 27 and day_name is "Wednesday",
+    the result is [(2026, "October", "2026-10-28")].
+    """
+    day_map = {
+        "Monday": 0,
+        "Tuesday": 1,
+        "Wednesday": 2,
+        "Thursday": 3,
+        "Friday": 4
+    }
+    target_weekday = day_map[day_name]
+
+    today = date.today()
+    year = today.year
+    month = today.month
+
+    # Last day of the current month
+    last_day = calendar.monthrange(year, month)[1]
+    end_of_month = date(year, month, last_day)
+
+    result = []
+    current = today
+
+    # Move to the next (or today if it matches) occurrence of the target weekday
+    while current.weekday() != target_weekday:
+        current += timedelta(days=1)
+        if current > end_of_month:
+            return result
+
+    # Collect all remaining occurrences until end of month
+    while current <= end_of_month:
+        month_name = current.strftime("%B")
+        date_str = current.strftime("%Y-%m-%d")
+        result.append((year, month_name, date_str))
+        current += timedelta(days=7)
+
+    return result
+
+
+def get_teacher_subject(teacher_username):
+    """Look up the subject a teacher handles (shown next to their slots)."""
+    for user in users:
+        if user[0] == teacher_username and user[2] == "teacher":
+            return user[4]
+    return "N/A"
+
+
+def get_student_info(student_account_id):
+    """Look up a student's name, section and ID (shown on the teacher's lists)."""
+    for user in users:
+        if user[0] == student_account_id and user[2] == "student":
+            return user[3], user[4], user[5]
+    return "Unknown", "Unknown", "Unknown"
+
+
+# ---------- BOOKING RULES (the heart of Problems 1, 2 and 3) ----------
+
+def find_slot(teacher, date_str, time):
+    """Find the slot that belongs to a given teacher, date, and time (or None).
+
+    Used when an appointment is cancelled, so we can find its slot and free it.
+    """
+    for s in slots:
+        if s[0] == teacher and s[6] == date_str and s[2] == time:
+            return s
+    return None
+
+
+def find_conflict(student_id, slot):
+    """Return the student's active appointment that clashes with `slot`, or None.
+
+    (Problem 2) A student can't be in two places at once. We only compare
+    appointments on the SAME DATE that are still "BOOKED" - cancelled or
+    finished ones don't block anything.
+    """
+    new_start = time_to_minutes(slot[2])
+    new_end = get_end_minutes(slot[2])
+    for a in appointments:
+        if a[0] == student_id and a[5] == "BOOKED" and a[6] == slot[6]:
+            # Two time ranges overlap when each one starts before the other ends.
+            if new_start < get_end_minutes(a[3]) and new_end > time_to_minutes(a[3]):
+                return a
+    return None
+
+
+def book_slot(student_id, slot, purpose):
+    """Book `slot` for a student: lock the slot and save a numbered appointment.
+
+    (Problem 2) Setting the slot to "BOOKED" hides it from other students,
+    so no two students are given the same arrival time.
+    (Problem 3) The reference number counts up (1, 2, 3...), giving a
+    written record of who booked first - no more informal walk-ins.
+
+    Safety check: if the slot is no longer OPEN, nothing is booked and None
+    is returned. This is the last line of defence against double booking.
+    """
+    if slot[3] != "OPEN":
+        return None
+    slot[3] = "BOOKED"
+    appointment = [student_id, slot[0], slot[1], slot[2], purpose, "BOOKED", slot[6], len(appointments) + 1]
+    appointments.append(appointment)
+    return appointment
+
+
+def cancel_appointment(appointment):
+    """Mark an appointment CANCELLED and give its slot back to other students.
+
+    (Problem 3) The appointment is kept in the list (not deleted), so the
+    history shows it was cancelled. Its slot becomes "OPEN" again so another
+    student can use that time.
+    """
+    appointment[5] = "CANCELLED"
+    slot = find_slot(appointment[1], appointment[6], appointment[3])
+    if slot:
+        slot[3] = "OPEN"
+
+
+def has_started(date_str, time):
+    """True if a session on `date_str` at `time` has already started (or the date has passed)."""
+    now = datetime.now()
+    today = now.date().isoformat()        # e.g. "2026-10-27"; dates in this form sort correctly as text
+    if date_str != today:
+        return date_str < today
+    return time_to_minutes(time) <= now.hour * 60 + now.minute
+
+
+def get_upcoming_slots(keyword=""):
+    """All slots that haven't started yet (OPEN and BOOKED), sorted by date and time.
+
+    (Problem 1) This is the full schedule students look at. Taken times are
+    still listed but marked "BOOKED", so students can see at a glance which
+    times are free and which are not.
+    - Hides dates that have already passed, and sessions earlier today that
+      have already started, so nobody plans a wasted trip.
+    - The keyword (e.g. "IT101" or a teacher's name) narrows the list.
+      Upper/lower case doesn't matter. An empty keyword shows everything.
+    """
+    keyword = keyword.lower()
+    result = []
+    for s in slots:
+        if has_started(s[6], s[2]):
+            continue                      # past date, or earlier today: no longer available
+        if keyword not in s[0].lower() and keyword not in get_teacher_subject(s[0]).lower():
+            continue
+        result.append(s)
+    # Earliest date first; on the same date, earliest start time first.
+    return sorted(result, key=lambda s: (s[6], time_to_minutes(s[2])))
+
+
+def get_open_slots(keyword=""):
+    """Only the upcoming slots that are still free to book (status "OPEN")."""
+    return [s for s in get_upcoming_slots(keyword) if s[3] == "OPEN"]
+
+
+def mark_done(appointment):
+    """Mark an appointment DONE, and its slot too. The record stays so it shows in history.
+
+    (Problem 3) Previously finished consultations were deleted. Now teachers
+    and students can look back at past sessions.
+    (Problem 1) The slot's status also changes to "DONE", so the schedule
+    students see shows that this consultation already took place.
+    """
+    appointment[5] = "DONE"
+    slot = find_slot(appointment[1], appointment[6], appointment[3])
+    if slot:
+        slot[3] = "DONE"
+
+
+def queue_order(appointment_list):
+    """Sort appointments by date, then start time: the order students arrive.
+
+    (Problem 2 and 3) Teachers see an orderly queue instead of a crowd.
+    """
+    return sorted(appointment_list, key=lambda a: (a[6], time_to_minutes(a[3])))
+
+
+# ---------- REGISTER ----------
+def register(role):
+    """Create a new student or teacher account, checking every answer first."""
+    print("\n===== REGISTER =====")
+
+    if role == "student":
+        # Keep asking until the student ID looks exactly like 02-2627-012345
+        # and nobody else has registered it.
+        while True:
+            student_id = input("Enter student ID (example: 02-2627-012345): ").strip()
+            if student_id == "":
+                print("Student ID cannot be empty.")
+                continue
+            parts = student_id.split("-")
+            if len(parts) != 3 or any(p == "" for p in parts):
+                print("Wrong format. Use exactly like this: 02-2627-012345")
+                continue
+            if not all(p.isdigit() for p in parts):
+                print("Student ID must be numerical only.")
+                continue
+            if len(parts[0]) != 2 or len(parts[1]) != 4 or len(parts[2]) != 6:
+                print("Wrong number of digits. Use format: XX-XXXX-XXXXXX")
+                continue
+            if any(u[2] == "student" and u[5] == student_id for u in users):
+                print("This Student ID is already registered.")
+                continue
+            break
+
+        while True:
+            password = input("Enter password: ").strip()
+            if password == "" or " " in password:
+                print("Password cannot be empty or contain spaces.")
+                continue
+            break
+
+        while True:
+            fullname = input("Enter full name: ").strip()
+            if fullname == "" or any(c.isdigit() for c in fullname):
+                print("Full name cannot be empty or contain numbers.")
+                continue
+            break
+
+        while True:
+            section = input("Enter section (example: COC-FB2-BSIT1-03): ").strip()
+            if section == "" or section != section.upper():
+                print("Section must be in UPPERCASE and not empty.")
+                continue
+            parts = section.split("-")
+            if len(parts) != 4 or any(p == "" for p in parts):
+                print("Wrong format. Use exactly like this: COC-FB2-BSIT1-03")
+                continue
+            break
+
+        users.append([student_id, password, "student", fullname, section, student_id])
+        print("Registration successful!")
+
+    else:  # Teacher
+        # Teachers log in with their full name, so two teachers can't share one.
+        while True:
+            fullname = input("Enter full name: ").strip()
+            if fullname == "" or any(c.isdigit() for c in fullname):
+                print("Full name cannot be empty or contain numbers.")
+                continue
+            if any(u[2] == "teacher" and u[3] == fullname for u in users):
+                print("This teacher name is already registered.")
+                continue
+            break
+
+        while True:
+            password = input("Enter password: ").strip()
+            if password == "" or " " in password:
+                print("Password cannot be empty or contain spaces.")
+                continue
+            break
+
+        # The subject is shown to students so they can find the right teacher (Problem 1).
+        while True:
+            subject = input("Enter subject you handle (example: IT101 - Introduction to Computing): ").strip()
+            if subject == "":
+                print("Subject cannot be empty.")
+                continue
+            break
+
+        users.append([fullname, password, "teacher", fullname, subject, ""])
+        print("Registration successful!")
+
+
+# ---------- LOGIN ----------
+def login(role):
+    """Ask for login details and return the matching user, or None if wrong."""
+    print("\n===== LOGIN =====")
+
+    if role == "student":
+        while True:
+            student_id = input("Student ID: ").strip()
+            if student_id == "":
+                print("Student ID cannot be empty.")
+                continue
+            break
+        while True:
+            password = input("Password: ").strip()
+            if password == "":
+                print("Password cannot be empty.")
+                continue
+            break
+
+        for user in users:
+            if user[2] == "student" and user[5] == student_id and user[1] == password:
+                print("Welcome,", user[3] + "!")
+                return user
+        print("Wrong Student ID or password.")
+        return None
+
+    else:
+        while True:
+            fullname = input("Full name: ").strip()
+            if fullname == "":
+                print("Full name cannot be empty.")
+                continue
+            break
+        while True:
+            password = input("Password: ").strip()
+            if password == "":
+                print("Password cannot be empty.")
+                continue
+            break
+
+        for user in users:
+            if user[2] == "teacher" and user[3] == fullname and user[1] == password:
+                print("Welcome,", user[3] + "!")
+                return user
+        print("Wrong full name or password.")
+        return None
+
+
+# ---------- TEACHER MENU ----------
+def teacher_menu(username):
+    """Everything a teacher can do after logging in. Repeats until they log out."""
+    while True:
+        print("\n===== TEACHER MENU =====")
+        print("[1] Add Slot (Auto-generate until end of current month)")
+        print("[2] View MySlots")
+        print("[3] View My Appointments")
+        print("[4] Mark Consultation as Done")
+        print("[5] Delete Open Slot")
+        print("[6] Logout / Back")
+
+        choice = input("Enter choice: ").strip()
+        if choice == "":
+            print("Choice cannot be empty.")
+            continue
+
+        # [1] ADD SLOT (Problems 1 and 2)
+        # The teacher enters a weekday and a free time block. The system splits it
+        # into 30-minute sessions and repeats it on every remaining matching
+        # weekday this month, so students can see and book these times.
+        if choice == "1":
+            print("\n--- Add Slot (Until End of Current Month Only) ---")
+            print("(Type 'back' at any time to cancel)")
+            print("Note: Time must be between 7:00 AM and 5:00 PM")
+            print("System will generate the schedule only until the end of this month.\n")
+
+            # Step 1: ask for the weekday.
+            while True:
+                day_input = input("Enter day (Monday-Friday) or 'back': ").strip().title()
+                if day_input.lower() == "back":
+                    print("Cancelled.")
+                    break
+                if day_input not in ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]:
+                    print("Invalid day. Enter Monday to Friday only.")
+                    continue
+                slot_day = day_input
+                break
+            if day_input.lower() == "back":
+                continue
+
+            # Step 2: ask for the time block and check it carefully.
+            while True:
+                time = input("Enter time (example: 10:00AM-11:00AM) or 'back': ").strip().upper()
+                if time.lower() == "back":
+                    print("Cancelled.")
+                    break
+                if time == "":
+                    print("Time cannot be empty.")
+                    continue
+
+                # Must be two times joined by a dash.
+                parts = time.split("-")
+                if len(parts) != 2:
+                    print("Wrong format. Use HH:MMAM-HH:MMAM")
+                    continue
+
+                start, end = parts[0].strip(), parts[1].strip()
+                if not (start.endswith(("AM", "PM")) and end.endswith(("AM", "PM"))):
+                    print("Time must end with AM or PM.")
+                    continue
+
+                # Hours and minutes must be numbers.
+                try:
+                    start_h, start_m = map(int, start[:-2].split(":"))
+                    end_h, end_m = map(int, end[:-2].split(":"))
+                except ValueError:
+                    print("Invalid time format.")
+                    continue
+
+                if not (1 <= start_h <= 12 and 1 <= end_h <= 12 and 0 <= start_m <= 59 and 0 <= end_m <= 59):
+                    print("Invalid hour or minutes.")
+                    continue
+
+                # Convert to minutes since midnight so the times can be compared.
+                start_24 = start_h % 12 + (12 if start.endswith("PM") else 0)
+                end_24 = end_h % 12 + (12 if end.endswith("PM") else 0)
+                if start.endswith("AM") and start_h == 12: start_24 = 0
+                if end.endswith("AM") and end_h == 12: end_24 = 0
+
+                start_total = start_24 * 60 + start_m
+                end_total = end_24 * 60 + end_m
+
+                # Consultations only happen during school hours.
+                if start_total < 7 * 60:
+                    print("Start time cannot be earlier than 7:00 AM.")
+                    continue
+                if end_total > 17 * 60:
+                    print("End time cannot be later than 5:00 PM.")
+                    continue
+                if end_total <= start_total:
+                    print("End time must be after start time.")
+                    continue
+
+                # Overlap check: the teacher can't offer two slots at the same
+                # time on the same weekday (this also catches exact duplicates).
+                overlap = False
+                for s in slots:
+                    if s[0] == username and s[1] == slot_day:
+                        es = time_to_minutes(s[2])
+                        ee = get_end_minutes(s[2])
+                        if start_total < ee and end_total > es:
+                            print(f"Overlaps with existing slot ({s[2]}).")
+                            overlap = True
+                            break
+                if overlap:
+                    continue
+
+                # (Problem 2) Cut the block into 30-minute sessions, one student each.
+                sessions = split_into_sessions(start_total, end_total)
+                if not sessions:
+                    print(f"Block must be at least {SESSION_MINUTES} minutes.")
+                    continue
+                break
+
+            if time.lower() == "back":
+                continue
+
+            # Generate only remaining days of CURRENT MONTH
+            remaining_dates = get_remaining_weekdays_this_month(slot_day)
+
+            if not remaining_dates:
+                print("No remaining days for this weekday in the current month.")
+                continue
+
+            # Create one OPEN slot for every session on every remaining date.
+            for year, month, date_str in remaining_dates:
+                for session in sessions:
+                    slots.append([username, slot_day, session, "OPEN", year, month, date_str])
+
+            # Show the teacher a summary of what was created.
+            print("\n" + "=" * 65)
+            print(f"  Successfully generated {len(sessions) * len(remaining_dates)} slots")
+            print(f"  ({len(sessions)} x {SESSION_MINUTES}-minute sessions on each of {len(remaining_dates)} dates)")
+            print(f"  (Until end of {remaining_dates[0][1]} {remaining_dates[0][0]})")
+            print(f"  Day  : {slot_day}")
+            print(f"  Time : {time}")
+            # Tell the teacher if a few minutes at the end couldn't fit a full session.
+            if get_end_minutes(sessions[-1]) < end_total:
+                print(f"  Note : last {end_total - get_end_minutes(sessions[-1])} minutes were too short for a session")
+            print("=" * 65)
+
+        # [2] VIEW MY SLOTS - every slot this teacher owns, in date and time order,
+        # with its status (OPEN = still free, BOOKED = a student has it).
+        elif choice == "2":
+            print("\n" + "=" * 90)
+            print("                              MY SLOTS")
+            print("=" * 90)
+            print(f"{'YEAR':<8} {'MONTH':<12} {'DAY':<12} {'DATE':<14} {'TIME':<18} {'STATUS':<10}")
+            print("-" * 90)
+
+            found = False
+            for s in sorted(slots, key=lambda s: (s[6], time_to_minutes(s[2]))):
+                if s[0] == username:
+                    print(f"{s[4]:<8} {s[5]:<12} {s[1]:<12} {s[6]:<14} {s[2]:<18} {s[3]:<10}")
+                    found = True
+            if not found:
+                print("No slots yet.")
+            print("=" * 90)
+
+        # [3] VIEW MY APPOINTMENTS (Problems 2 and 3)
+        # The teacher's queue in arrival order, plus finished and cancelled ones
+        # so past sessions can be tracked. REF # shows who booked first.
+        elif choice == "3":
+            print("\n" + "=" * 150)
+            print("                           MY APPOINTMENTS (QUEUE + HISTORY)")
+            print("=" * 150)
+            print(f"{'REF #':<7} {'DATE':<12} {'TIME':<18} {'STUDENT ID':<16} {'SECTION':<20} {'NAME':<20} {'PURPOSE':<30} {'STATUS':<10}")
+            print("-" * 150)
+
+            found = False
+            for a in queue_order(a for a in appointments if a[1] == username):
+                name, section, sid = get_student_info(a[0])
+                print(f"{a[7]:<7} {a[6]:<12} {a[3]:<18} {sid:<16} {section:<20} {name:<20} {a[4]:<30} {a[5]:<10}")
+                found = True
+            if not found:
+                print("No appointments yet.")
+            print("=" * 150)
+
+        # [4] MARK CONSULTATION AS DONE (Problem 3)
+        # Only upcoming ("BOOKED") appointments are listed. Marking one DONE keeps
+        # it in the history instead of deleting it.
+        elif choice == "4":
+            teacher_apps = queue_order(a for a in appointments if a[1] == username and a[5] == "BOOKED")
+            total = len(teacher_apps)
+            if total == 0:
+                print("No active appointments to mark as done.")
+                continue
+
+            print("\n" + "=" * 120)
+            print("                    MARK CONSULTATION AS DONE")
+            print("=" * 120)
+            print(f"{'#':<4} {'STUDENT ID':<16} {'SECTION':<20} {'NAME':<20} {'DATE':<12} {'TIME':<18} {'PURPOSE':<20}")
+            print("-" * 120)
+
+            for i, a in enumerate(teacher_apps, 1):
+                name, section, sid = get_student_info(a[0])
+                print(f"{i:<4} {sid:<16} {section:<20} {name:<20} {a[6]:<12} {a[3]:<18} {a[4]:<20}")
+            print("-" * 120)
+            print(f"[{total + 1}] Back")
+
+            # The last number in the list means "Back".
+            while True:
+                num = input("\nEnter number of consultation that is DONE: ").strip()
+                if not num.isdigit():
+                    print("Invalid input.")
+                    continue
+                num = int(num)
+                if num == total + 1:
+                    print("Cancelled.")
+                    break
+                if 1 <= num <= total:
+                    mark_done(teacher_apps[num - 1])
+                    print("Consultation marked as DONE! (It stays in your history.)")
+                    break
+                print("Invalid number.")
+
+        # [5] DELETE OPEN SLOT - a teacher can remove a time nobody has booked yet.
+        # Booked slots can't be deleted, so a student's appointment never vanishes.
+        elif choice == "5":
+            open_slots = [s for s in slots if s[0] == username and s[3] == "OPEN"]
+            total = len(open_slots)
+            if total == 0:
+                print("You have no OPEN slots to delete.")
+                continue
+
+            print("\n" + "=" * 80)
+            print("                       DELETE OPEN SLOT")
+            print("=" * 80)
+            print(f"{'#':<4} {'YEAR':<8} {'MONTH':<12} {'DAY':<12} {'DATE':<14} {'TIME':<18}")
+            print("-" * 80)
+
+            for i, s in enumerate(open_slots, 1):
+                print(f"{i:<4} {s[4]:<8} {s[5]:<12} {s[1]:<12} {s[6]:<14} {s[2]:<18}")
+            print("-" * 80)
+            print(f"[{total + 1}] Back")
+
+            while True:
+                num = input("\nEnter number of slot to DELETE: ").strip()
+                if not num.isdigit():
+                    print("Invalid input.")
+                    continue
+                num = int(num)
+                if num == total + 1:
+                    print("Cancelled.")
+                    break
+                if 1 <= num <= total:
+                    slots.remove(open_slots[num - 1])
+                    print("Open slot deleted successfully!")
+                    break
+                print("Invalid number.")
+
+        # [6] LOGOUT - leave this menu and go back to the main screen.
+        elif choice == "6":
+            print("Logged out.")
+            break
+        else:
+            print("Invalid choice.")
+
+
+# ---------- STUDENT MENU ----------
+def student_menu(account_id):
+    """Everything a student can do after logging in. Repeats until they log out."""
+    while True:
+        print("\n===== STUDENT MENU =====")
+        print("[1] View AvailableSlots")
+        print("[2] Book Appointment")
+        print("[3] View My Appointments")
+        print("[4] Cancel Appointment")
+        print("[5] Logout / Back")
+
+        choice = input("Enter choice: ").strip()
+        if choice == "":
+            print("Choice cannot be empty.")
+            continue
+
+        # [1] VIEW AVAILABLE SLOTS (Problem 1)
+        # Shows every upcoming time in date order. Free times say OPEN; times
+        # another student already took say BOOKED; finished ones say DONE. The student knows exactly
+        # when a teacher is available before going to the office.
+        if choice == "1":
+            keyword = input("Search by subject or teacher (press Enter to show all): ").strip()
+            print("\n" + "=" * 130)
+            print("                              AVAILABLE SLOTS")
+            print("=" * 130)
+            print(f"{'TEACHER':<20} {'SUBJECT':<30} {'YEAR':<8} {'MONTH':<12} {'DAY':<12} {'DATE':<14} {'TIME':<18} {'STATUS':<10}")
+            print("-" * 130)
+
+            found = False
+            for s in get_upcoming_slots(keyword):
+                subject = get_teacher_subject(s[0])
+                print(f"{s[0]:<20} {subject:<30} {s[4]:<8} {s[5]:<12} {s[1]:<12} {s[6]:<14} {s[2]:<18} {s[3]:<10}")
+                found = True
+            if not found:
+                print("No upcoming slots.")
+            print("=" * 130)
+
+        # [2] BOOK APPOINTMENT (Problems 2 and 3)
+        # The student picks a free 30-minute session. It is locked to them, so
+        # nobody else arrives at the same time, and a numbered record is saved.
+        elif choice == "2":
+            keyword = input("Search by subject or teacher (press Enter to show all): ").strip()
+            available = get_open_slots(keyword)
+            total = len(available)
+            if total == 0:
+                print("No available slots to book.")
+                continue
+
+            print("\n" + "=" * 125)
+            print("                           BOOK APPOINTMENT")
+            print("=" * 125)
+            print(f"{'#':<4} {'TEACHER':<18} {'SUBJECT':<28} {'YEAR':<8} {'MONTH':<12} {'DAY':<10} {'DATE':<14} {'TIME':<16}")
+            print("-" * 125)
+
+            for i, s in enumerate(available, 1):
+                subject = get_teacher_subject(s[0])
+                print(f"{i:<4} {s[0]:<18} {subject:<28} {s[4]:<8} {s[5]:<12} {s[1]:<10} {s[6]:<14} {s[2]:<16}")
+            print("-" * 125)
+            print(f"[{total + 1}] Back")
+
+            while True:
+                num = input("\nEnter number of the slot you want to book: ").strip()
+                if not num.isdigit():
+                    print("Invalid input.")
+                    continue
+                num = int(num)
+                if num == total + 1:
+                    print("Cancelled.")
+                    break
+                if not (1 <= num <= total):
+                    print("Invalid number.")
+                    continue
+
+                chosen = available[num - 1]
+                teacher, day, time = chosen[0], chosen[1], chosen[2]
+                subject = get_teacher_subject(teacher)
+
+                # Stop the student from double-booking themselves on the same date.
+                clash = find_conflict(account_id, chosen)
+                if clash:
+                    print(f"Overlaps with your existing appointment (Teacher: {clash[1]}, Date: {clash[6]}, Time: {clash[3]})")
+                    continue
+
+                # The purpose helps the teacher prepare, so the session isn't rushed.
+                purpose = ""
+                while purpose == "":
+                    purpose = input("Enter purpose of consultation: ").strip()
+                    if purpose == "":
+                        print("Purpose cannot be empty.")
+
+                appointment = book_slot(account_id, chosen, purpose)
+                if appointment is None:
+                    print("Sorry, that time was just booked by someone else. Please pick another.")
+                    continue
+
+                # Confirmation "ticket" with the reference number and exact arrival time.
+                print("\n" + "=" * 50)
+                print("  APPOINTMENT BOOKED SUCCESSFULLY")
+                print("=" * 50)
+                print(f"  Ref No. : {appointment[7]}")
+                print(f"  Teacher : {teacher}")
+                print(f"  Subject : {subject}")
+                print(f"  Day     : {day}")
+                print(f"  Date    : {chosen[6]}")
+                print(f"  Time    : {time}")
+                print(f"  Purpose : {purpose}")
+                print("=" * 50)
+                break
+
+        # [3] VIEW MY APPOINTMENTS (Problem 3)
+        # All of the student's appointments - upcoming, done and cancelled -
+        # with their reference number and status.
+        elif choice == "3":
+            print("\n" + "=" * 145)
+            print("                           MY APPOINTMENTS")
+            print("=" * 145)
+            print(f"{'REF #':<7} {'TEACHER':<20} {'SUBJECT':<30} {'DATE':<12} {'DAY':<12} {'TIME':<18} {'PURPOSE':<20} {'STATUS':<10}")
+            print("-" * 145)
+
+            found = False
+            for a in queue_order(a for a in appointments if a[0] == account_id):
+                subject = get_teacher_subject(a[1])
+                print(f"{a[7]:<7} {a[1]:<20} {subject:<30} {a[6]:<12} {a[2]:<12} {a[3]:<18} {a[4]:<20} {a[5]:<10}")
+                found = True
+            if not found:
+                print("No appointments yet.")
+            print("=" * 145)
+
+        # [4] CANCEL APPOINTMENT (Problems 2 and 3)
+        # Only upcoming appointments can be cancelled (one that already happened
+        # can't be rewritten as CANCELLED). The record is kept as CANCELLED and
+        # the time slot is freed for another student.
+        elif choice == "4":
+            my_apps = [a for a in appointments
+                       if a[0] == account_id and a[5] == "BOOKED" and not has_started(a[6], a[3])]
+            total = len(my_apps)
+            if total == 0:
+                print("You have no active appointments to cancel.")
+                continue
+
+            print("\n" + "=" * 105)
+            print("                         CANCEL APPOINTMENT")
+            print("=" * 105)
+            print(f"{'#':<4} {'TEACHER':<18} {'SUBJECT':<28} {'DATE':<12} {'DAY':<12} {'TIME':<16} {'PURPOSE':<20}")
+            print("-" * 105)
+
+            for i, a in enumerate(my_apps, 1):
+                subject = get_teacher_subject(a[1])
+                print(f"{i:<4} {a[1]:<18} {subject:<28} {a[6]:<12} {a[2]:<12} {a[3]:<16} {a[4]:<20}")
+            print("-" * 105)
+            print(f"[{total + 1}] Back")
+
+            while True:
+                num = input("\nEnter number of the appointment to CANCEL: ").strip()
+                if not num.isdigit():
+                    print("Invalid input.")
+                    continue
+                num = int(num)
+                if num == total + 1:
+                    print("Cancelled.")
+                    break
+                if 1 <= num <= total:
+                    cancel_appointment(my_apps[num - 1])
+                    print("Appointment cancelled successfully! The slot is open for other students again.")
+                    break
+                print("Invalid number.")
+
+        # [5] LOGOUT - leave this menu and go back to the main screen.
+        elif choice == "5":
+            print("Logged out.")
+            break
+        else:
+            print("Invalid choice.")
+
+
+# ---------- START OF PROGRAM ----------
+def main():
+    """The first screen: choose Student or Teacher, then Register or Login."""
+    while True:
+        print("\n" + "=" * 78)
+        print("  CONSOLE-BASED ACADEMIC CONSULTATION APPOINTMENT SCHEDULER FOR BSIT FRESHMEN")
+        print("=" * 78)
+        print("[1] Student")
+        print("[2] Teacher")
+        print("[3] Exit")
+
+        choice = input("Enter choice: ").strip()
+        if choice == "":
+            print("Choice cannot be empty.")
+            continue
+
+        if choice == "1":
+            print("\n--- Student Options ---")
+            print("[1] Register")
+            print("[2] Login")
+            print("[3] Back")
+            sub = input("Enter choice: ").strip()
+            if sub == "1":
+                register("student")
+            elif sub == "2":
+                user = login("student")
+                if user and user[2] == "student":
+                    student_menu(user[0])
+            elif sub == "3":
+                continue
+            else:
+                print("Invalid choice.")
+
+        elif choice == "2":
+            print("\n--- Teacher Options ---")
+            print("[1] Register")
+            print("[2] Login")
+            print("[3] Back")
+            sub = input("Enter choice: ").strip()
+            if sub == "1":
+                register("teacher")
+            elif sub == "2":
+                user = login("teacher")
+                if user and user[2] == "teacher":
+                    teacher_menu(user[0])
+            elif sub == "3":
+                continue
+            else:
+                print("Invalid choice.")
+
+        elif choice == "3":
+            print("Thank you. Goodbye!")
+            break
+        else:
+            print("Invalid choice.")
+
+
+# Start the menu only when this file is run directly (python3 main.py).
+# This lets the test file load these functions without starting the menu.
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl+C or a closed input ends the program politely instead of
+        # printing a long error message.
+        print("\nThank you. Goodbye!")
